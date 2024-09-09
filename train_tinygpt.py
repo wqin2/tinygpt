@@ -19,13 +19,13 @@ class CausalSelfAttention(nn.Module):
     def forward(self, x):
         qkv = self.c_attn(x)
         B, T, C = x.size()
-        q, k, v = qkv.split(C, dim=-2) # each with shape (B, T, C)
+        q, k, v = qkv.split(C, dim=2) # each with shape (B, T, C)
         # multi-headed attention
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1))) # (B, nh, T, T)
-        att = att.masked_fill(self.bias == 0, float('-inf')) # modified fron nanoGPT
+        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf')) # why this critical?
         att = F.softmax(att, dim=-1)
         y = att @ v # (B, nh, T, T) x (b, nh, T, hs) -> (B, nh, T, hs)
         y = y.transpose(1, 2).contiguous().view(B, T, C) # reassemble all heads
@@ -144,6 +144,41 @@ class GPT(nn.Module):
         return model
 
 # ------------------------------------------------------------------------------
-model = GPT.from_pretrained('gpt2')
-print("didn't crash yay!")
+num_return_sequences = 5
+max_length = 50
 
+model = GPT.from_pretrained('gpt2')
+model.eval() # good practice to put model to eval mode during generation
+model.to('cuda')
+
+# prefix tokens
+import tiktoken
+enc = tiktoken.get_encoding('gpt2')
+tokens = enc.encode("Hello, I'm a language model,")
+tokens = torch.tensor(tokens, dtype=torch.long) # (8, )
+tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) # (5, 8)
+x = tokens.to('cuda')
+
+# generate
+# set seed
+torch.manual_seed(42)
+torch.cuda.manual_seed(42)
+while x.size(1) < max_length: # generate when not excedding max_length
+    # forward the model to get logits
+    with torch.no_grad(): # put to no_grad when generating
+        logits = model(x)
+        logits = logits[:, -1, :] # (B, vocab_size); only take the logits of last sequence position
+        probs = F.softmax(logits, dim=-1)
+        # top-k sampling
+        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1) # both (5, 50)
+        # note: multinomial does not demand the input to sum to 1
+        ix = torch.multinomial(topk_probs, 1) # (B, 1); draw 1 from topk_probs
+        # gather the corresponding indices
+        xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
+        x = torch.cat((x, xcol), dim=1)
+
+# print the generated text
+for i in range(num_return_sequences):
+    tokens = x[i, :max_length].tolist()
+    decoded = enc.decode(tokens)
+    print(">", decoded)
