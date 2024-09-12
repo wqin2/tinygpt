@@ -82,7 +82,7 @@ class GPT(nn.Module):
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
     
-    def forward(self, idx):
+    def forward(self, idx, targets=None):
         # idx is of size (B, T)
         B, T = idx.size()
         assert T <=self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
@@ -94,7 +94,10 @@ class GPT(nn.Module):
             x = block(x)
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x) # (B, T, vocab_size); output is logits
-        return logits
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        return logits, loss
 
     @classmethod
     def from_pretrained(cls, model_type):
@@ -125,10 +128,10 @@ class GPT(nn.Module):
 
         # copy while ensuring all of the params are aligned and match in names and shapes
         sd_keys_hf = sd_hf.keys()
-        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')]
-        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')]
+        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')] # discard this mask 
+        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')] # discard this mask 
         transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
-        # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
+        # openai checkpoints used a "Conv1D" module, but we only want to use a vanilla Linear
         # this means that we have to transpose these weights when we import them
         assert len(sd_keys) == len(sd_keys_hf), f'mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}'
         for k in sd_keys_hf:
@@ -155,18 +158,28 @@ print(f"using device: {device}")
 num_return_sequences = 5
 max_length = 50
 
-# model = GPT.from_pretrained('gpt2')
-model = GPT(GPTConfig())
-model.eval() # good practice to put model to eval mode during generation
-model.to('cuda')
-
-# prefix tokens
+# get a databatch
 import tiktoken
 enc = tiktoken.get_encoding('gpt2')
-tokens = enc.encode("Hello, I'm a language model,")
-tokens = torch.tensor(tokens, dtype=torch.long) # (8, )
-tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) # (5, 8)
-x = tokens.to('cuda')
+with open('input.txt', 'r') as f:
+    text = f.read()
+text = text[:1000]
+tokens = enc.encode(text)
+B, T = 4, 32
+buf = torch.tensor(tokens[:B*T + 1], dtype=torch.long)
+x = buf[:-1].view(B, T)
+y = buf[1:].view(B, T)
+x = x.to(device)
+y = y.to(device)
+
+# model = GPT.from_pretrained('gpt2')
+# get logits and loss
+model = GPT(GPTConfig())
+model.to(device)
+logits, loss = model(x, y)
+
+print(loss)
+import sys; sys.exit(0)
 
 # generate
 # set seed
