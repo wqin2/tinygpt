@@ -12,6 +12,7 @@ class CausalSelfAttention(nn.Module):
         assert config.n_embd % config.n_head == 0 # n_embd is divisible by n_head
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd) # q, k, v projection in a batch
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.c_proj.GPT_SCALE_INIT = 1
         self.n_head = config.n_head
         self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                              .view(1, 1, config.block_size, config.block_size))
@@ -39,6 +40,7 @@ class MLP(nn.Module):
         self.c_fc   = nn.Linear(config.n_embd, 4 * config.n_embd)
         self.gelu   = nn.GELU(approximate="tanh")
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
+        self.c_proj.GPT_SCALE_INIT = 1
     
     def forward(self, x):
         x = self.c_fc(x)
@@ -72,7 +74,7 @@ class GPT(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.config = config # is this really needed?
+        self.config = config # is this really needed? yes, it is called in init_weight()
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
@@ -81,7 +83,24 @@ class GPT(nn.Module):
             ln_f = nn.LayerNorm(config.n_embd),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        
+        # weight sharing
+        self.transformer.wte.weight = self.lm_head.weight
+
+        # init parameters
+        self.apply(self._init_weight)
     
+    def _init_weight(self, module):
+        if isinstance(module, nn.Linear):
+            std = 0.02
+            if hasattr(module, 'GPT_SCALE_INIT'):
+                std *= (2 * self.config.n_layer) ** -0.5
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
     def forward(self, idx, targets=None):
         # idx is of size (B, T)
         B, T = idx.size()
@@ -147,6 +166,35 @@ class GPT(nn.Module):
         return model
 
 # ------------------------------------------------------------------------------
+import tiktoken
+class DataLoaderLite:
+    def __init__(self, B, T):
+        self.B = B
+        self.T = T
+        with open('input.txt', 'r') as f:
+            text = f.read()
+        enc = tiktoken.get_encoding('gpt2')
+        tokens = enc.encode(text)
+        self.tokens = torch.tensor(tokens)
+        print(f"loaded {len(tokens)} tokens")
+        print(f"1 epoch = {len(tokens)// (B * T)} batches")
+
+        # state
+        self.current_position = 0
+    
+    def next_batch(self):
+        B, T = self.B, self.T
+        buf = self.tokens[self.current_position : self.current_position+B*T+1]
+        x = buf[:-1].view(B, T)
+        y = buf[1:].view(B, T)
+        # advance the position
+        self.current_position += B * T
+        # if loading the next batch would be out of bound, reset
+        if self.current_position + (B * T) + 1 > len(self.tokens):
+            self.current_position = 0
+        return x, y
+        
+# ------------------------------------------------------------------------------
 # autodetect the device
 device = "cpu"
 if torch.cuda.is_available():
@@ -158,27 +206,30 @@ print(f"using device: {device}")
 num_return_sequences = 5
 max_length = 50
 
+# model's weight random initialization
+torch.manual_seed(42)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(42)
+
 # get a databatch
-import tiktoken
-enc = tiktoken.get_encoding('gpt2')
-with open('input.txt', 'r') as f:
-    text = f.read()
-text = text[:1000]
-tokens = enc.encode(text)
-B, T = 4, 32
-buf = torch.tensor(tokens[:B*T + 1], dtype=torch.long)
-x = buf[:-1].view(B, T)
-y = buf[1:].view(B, T)
-x = x.to(device)
-y = y.to(device)
+train_loader = DataLoaderLite(B=4, T=32)
 
 # model = GPT.from_pretrained('gpt2')
 # get logits and loss
 model = GPT(GPTConfig())
 model.to(device)
-logits, loss = model(x, y)
 
-print(loss)
+# optimize
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+for i in range(50):
+    x, y = train_loader.next_batch()
+    x, y = x.to(device), y.to(device)
+    optimizer.zero_grad()
+    logits, loss = model(x, y)
+    loss.backward()
+    optimizer.step()
+    print(f"step {i}, loss: {loss.item()}")
+
 import sys; sys.exit(0)
 
 # generate
