@@ -283,6 +283,8 @@ else:
         device = "mps"
     print(f"using device: {device}")
 
+enc = tiktoken.get_encoding("gpt-2")
+
 # for model's weight random initialization
 torch.manual_seed(42)
 if torch.cuda.is_available():
@@ -333,7 +335,7 @@ def get_lr(it):
 optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
 for step in range(max_steps):
     t0 = time.time()
-
+    
     # once in a while, evaluate our validation loss
     if step % 100 == 0:
         model.eval()
@@ -353,6 +355,38 @@ for step in range(max_steps):
         if master_process:
             print(f"validation loss: {val_loss_accum.item():.4f}")
     
+    # once in a while, generate from the model (except for step 0, which is noise)
+    # diabled because torch.compile throws a error; need debug
+    # if disables torch.compile, this works fine
+    if step > 0 and step % 100 == 0:
+        model.eval()
+        num_return_sequences = 4
+        max_length = 32
+        tokens = enc.encode("Hello, I'm a language model,")
+        tokens = torch.tensor(tokens, dtype=torch.long)
+        tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
+        xgen = tokens.to(device)
+        sample_rng = torch.Generator(device=device)
+        sample_rng.manual_seed(42 + ddp_rank)
+        while xgen.size(1) < max_length:    
+            # forward the model to get logits
+            with torch.no_grad(): # put to no_grad when generating
+                logits, loss = model(xgen)
+                logits = logits[:, -1, :] # (B, vocab_size); only take the logits of last sequence position
+                probs = F.softmax(logits, dim=-1)
+                # top-k sampling
+                topk_probs, topk_indices = torch.topk(probs, 50, dim=-1) # both (5, 50)
+                # note: multinomial does not demand the input to sum to 1
+                ix = torch.multinomial(topk_probs, 1, generator=sample_rng) # (B, 1); draw 1 from topk_probs
+                # gather the corresponding indices
+                xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
+                xgen = torch.cat((x, xcol), dim=1)
+        # print the generated text
+        for i in range(num_return_sequences):
+            tokens = x[i, :max_length].tolist()
+            decoded = enc.decode(tokens)
+            print(f"rank {ddp_rank} sample {i}: {decoded}")
+
     # training loop
     model.train()
     optimizer.zero_grad()
@@ -390,6 +424,7 @@ for step in range(max_steps):
 
 if ddp:
     destroy_process_group()
+
 
 import sys; sys.exit(0)
 
