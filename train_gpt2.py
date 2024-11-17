@@ -92,6 +92,9 @@ class GPT(nn.Module):
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False) # gpt uses no bias for the final projection
 
+        # weight sharing scheme
+        self.transformer.wte.weight = self.lm_head.weight
+
     def forward(self, idx, targets=None):
         # idx is of shape (B, T); input of the model is token indices
         B, T = idx.size()
