@@ -266,7 +266,7 @@ if ddp:
     ddp_world_size = int(os.environ['WORLD_SIZE'])
     device = f'cuda: {ddp_local_rank}'
     torch.cuda.set_device(device)
-    master_process = ddo_rank == 0 # this process will do logging, checkpointing etc.
+    master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
 else:
     # vanilla, non-DDP run
     ddp_rank = 0
@@ -361,7 +361,7 @@ for step in range(max_steps):
 
 if ddp:
     destroy_process_group()
-    
+
 import sys; sys.exit(0)
 
 model.eval()
